@@ -254,10 +254,22 @@ class LlamaMLP(nn.Module):
                 F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(self.config.pretraining_tp)
             ]
             down_proj = sum(down_proj)
+            blc_loss = None
         else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            tmp1 = self.gate_proj(x)  # (result, loss) 或 result
+            tmp2 = self.up_proj(x)    # (result, loss) 或 result
+            if isinstance(tmp1, tuple):
+                tmp3 = self.down_proj(self.act_fn(tmp1[0]) * tmp2[0])  # 如果 tmp1 和 tmp2 是元组
+                down_proj = tmp3[0]
+                if tmp1[1]:
+                    blc_loss = tmp1[1] + tmp2[1] + tmp3[1]
+                else:
+                    blc_loss = None
+            else:
+                down_proj = self.down_proj(self.act_fn(tmp1) * tmp2)
+                blc_loss = None
 
-        return down_proj
+        return down_proj, blc_loss
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -671,7 +683,7 @@ class LlamaDecoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
-
+        
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -689,7 +701,7 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, blc_loss = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -700,7 +712,7 @@ class LlamaDecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
 
-        return outputs
+        return outputs, blc_loss
 
 
 LLAMA_START_DOCSTRING = r"""
@@ -924,13 +936,14 @@ class LlamaModel(LlamaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
+        blclss = torch.zeros(1)[0].to(hidden_states)
 
         for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
+                layer_outputs, blc = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
                     causal_mask,
@@ -942,7 +955,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     position_embeddings,
                 )
             else:
-                layer_outputs = decoder_layer(
+                layer_outputs, blc = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
@@ -952,6 +965,8 @@ class LlamaModel(LlamaPreTrainedModel):
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                 )
+            
+            blclss += blc
 
             hidden_states = layer_outputs[0]
 
@@ -978,7 +993,7 @@ class LlamaModel(LlamaPreTrainedModel):
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-        )
+        ), blclss
 
     def _update_causal_mask(
         self,
@@ -1187,7 +1202,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
+        outputs, blclss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1212,6 +1227,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **loss_kwargs)
+            loss = loss + 0.01 * blclss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
