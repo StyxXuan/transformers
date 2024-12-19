@@ -97,16 +97,16 @@ def load_balancing_loss_func(
     _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
 
     expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+    expert_mask = expert_mask.to(torch.float32)
 
     # Compute the percentage of tokens routed to each experts
-    tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+    tokens_per_expert = torch.mean(expert_mask, dim=0)
 
     # Compute the average probability of routing to these experts
     router_prob_per_expert = torch.mean(routing_weights, dim=0)
     
     overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
     return overall_loss * num_experts
-
 
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -126,7 +126,6 @@ class LlamaRMSNorm(nn.Module):
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
 
 ALL_LAYERNORM_LAYERS.append(LlamaRMSNorm)
 
@@ -313,8 +312,7 @@ class LlamaMLP(nn.Module):
             if isinstance(tmp1, tuple):
                 tmp3 = self.down_proj(self.act_fn(tmp1[0]) * tmp2[0])  # 如果 tmp1 和 tmp2 是元组
                 down_proj = tmp3[0]
-                if tmp1[1]:
-                    router_outputs += (tmp1[1], tmp2[1], tmp3[1])
+                router_outputs += (tmp1[1], tmp2[1], tmp3[1])
             else:
                 down_proj = self.down_proj(self.act_fn(tmp1) * tmp2)
 
@@ -992,7 +990,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-                layer_outputs, router_outputs = self._gradient_checkpointing_func(
+                layer_outputs, router_output = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
                     causal_mask,
@@ -1196,16 +1194,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
     
-    def _unpack_router_logits(self, router_outputs):
-        total_router_logits = []
-        total_expert_indexes = []
-        for router_output in router_outputs:
-            if len(router_output[0].shape) > 1:
-                router_logits, expert_indexes = router_output
-                total_router_logits.append(router_logits)
-                total_expert_indexes.append(expert_indexes)
-        return torch.cat(total_router_logits, dim=1), torch.cat(total_expert_indexes, dim=1)
-
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
