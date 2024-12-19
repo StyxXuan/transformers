@@ -57,6 +57,45 @@ _CHECKPOINT_FOR_DOC = "meta-llama/Llama-2-7b-hf"
 _CONFIG_FOR_DOC = "LlamaConfig"
 
 
+def load_balancing_loss_func(router_probs: torch.Tensor, expert_indices: torch.Tensor) -> float:
+    r"""
+    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
+
+    See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
+    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
+    experts is too unbalanced.
+
+    Args:
+        router_probs (`torch.Tensor`):
+            Probability assigned to each expert per token. Shape: [batch_size, seqeunce_length, num_experts].
+        expert_indices (`torch.Tensor`):
+            Indices tensor of shape [batch_size, seqeunce_length] identifying the selected expert for a given token.
+
+    Returns:
+        The auxiliary loss.
+    """
+    num_experts = router_probs.shape[-1]
+
+    # cast the expert indices to int64, otherwise one-hot encoding will fail
+    if expert_indices.dtype != torch.int64:
+        expert_indices = expert_indices.to(torch.int64)
+
+    if len(expert_indices.shape) == 2:
+        expert_indices = expert_indices.unsqueeze(2)
+
+    expert_mask = torch.nn.functional.one_hot(expert_indices, num_experts)
+
+    # For a given token, determine if it was routed to a given expert.
+    expert_mask = torch.max(expert_mask, axis=-2).values
+
+    # cast to float32 otherwise mean will fail
+    expert_mask = expert_mask.to(torch.float32)
+    tokens_per_group_and_expert = torch.mean(expert_mask, axis=-2)
+
+    router_prob_per_group_and_expert = torch.mean(router_probs, axis=-2)
+    return torch.mean(tokens_per_group_and_expert * router_prob_per_group_and_expert) * (num_experts**2)
+
+
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -254,22 +293,20 @@ class LlamaMLP(nn.Module):
                 F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(self.config.pretraining_tp)
             ]
             down_proj = sum(down_proj)
-            blc_loss = None
+            router_outputs = ()
         else:
+            router_outputs = ()
             tmp1 = self.gate_proj(x)  # (result, loss) 或 result
             tmp2 = self.up_proj(x)    # (result, loss) 或 result
             if isinstance(tmp1, tuple):
                 tmp3 = self.down_proj(self.act_fn(tmp1[0]) * tmp2[0])  # 如果 tmp1 和 tmp2 是元组
                 down_proj = tmp3[0]
                 if tmp1[1]:
-                    blc_loss = tmp1[1] + tmp2[1] + tmp3[1]
-                else:
-                    blc_loss = None
+                    router_outputs += (tmp1[1], tmp2[1], tmp3[1])
             else:
                 down_proj = self.down_proj(self.act_fn(tmp1) * tmp2)
-                blc_loss = None
 
-        return down_proj, blc_loss
+        return down_proj, router_outputs
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -701,7 +738,7 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, blc_loss = self.mlp(hidden_states)
+        hidden_states, router_outputs = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -712,7 +749,7 @@ class LlamaDecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
 
-        return outputs, blc_loss
+        return outputs, router_outputs
 
 
 LLAMA_START_DOCSTRING = r"""
@@ -936,14 +973,14 @@ class LlamaModel(LlamaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
-        blclss = torch.zeros(1)[0].to(hidden_states)
+        all_router_outputs = ()
 
         for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-                layer_outputs, blc = self._gradient_checkpointing_func(
+                layer_outputs, router_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
                     causal_mask,
@@ -955,7 +992,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     position_embeddings,
                 )
             else:
-                layer_outputs, blc = decoder_layer(
+                layer_outputs, router_output = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
@@ -966,7 +1003,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     position_embeddings=position_embeddings,
                 )
             
-            blclss += blc
+            all_router_outputs += router_output
 
             hidden_states = layer_outputs[0]
 
@@ -993,7 +1030,7 @@ class LlamaModel(LlamaPreTrainedModel):
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-        ), blclss
+        ), all_router_outputs
 
     def _update_causal_mask(
         self,
@@ -1146,6 +1183,16 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.model
+    
+    def _unpack_router_logits(self, router_outputs):
+        total_router_logits = []
+        total_expert_indexes = []
+        for router_output in router_outputs:
+            if len(router_output[0].shape) > 1:
+                router_logits, expert_indexes = router_output
+                total_router_logits.append(router_logits)
+                total_expert_indexes.append(expert_indexes)
+        return torch.cat(total_router_logits, dim=1), torch.cat(total_expert_indexes, dim=1)
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -1202,7 +1249,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs, blclss = self.model(
+        outputs, all_router_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1227,6 +1274,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **loss_kwargs)
+            all_router_probs, all_expert_indexes = self._unpack_router_logits(all_router_outputs)
+            blclss = load_balancing_loss_func(all_router_probs, all_expert_indexes)
             loss = loss + 0.01 * blclss
 
         if not return_dict:
