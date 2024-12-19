@@ -56,8 +56,12 @@ logger = logging.get_logger(__name__)
 _CHECKPOINT_FOR_DOC = "meta-llama/Llama-2-7b-hf"
 _CONFIG_FOR_DOC = "LlamaConfig"
 
-
-def load_balancing_loss_func(router_probs: torch.Tensor, expert_indices: torch.Tensor) -> float:
+def load_balancing_loss_func(
+    gate_logits: Union[torch.Tensor, Tuple[torch.Tensor], None],
+    num_experts: Optional[int] = None,
+    top_k=2,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, int]:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
 
@@ -66,34 +70,42 @@ def load_balancing_loss_func(router_probs: torch.Tensor, expert_indices: torch.T
     experts is too unbalanced.
 
     Args:
-        router_probs (`torch.Tensor`):
-            Probability assigned to each expert per token. Shape: [batch_size, seqeunce_length, num_experts].
-        expert_indices (`torch.Tensor`):
-            Indices tensor of shape [batch_size, seqeunce_length] identifying the selected expert for a given token.
+        gate_logits:
+            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
+            shape [batch_size X sequence_length, num_experts].
+        num_experts:
+            Number of experts
+        top_k:
+            The number of experts to route per-token, can be also interpreted as the `top-k` routing
+            parameter.
+        attention_mask (`torch.Tensor`, *optional*):
+            The attention_mask used in forward function
+            shape [batch_size X sequence_length] if not None.
 
     Returns:
         The auxiliary loss.
     """
-    num_experts = router_probs.shape[-1]
+    if gate_logits is None or not isinstance(gate_logits, tuple):
+        return 0
 
-    # cast the expert indices to int64, otherwise one-hot encoding will fail
-    if expert_indices.dtype != torch.int64:
-        expert_indices = expert_indices.to(torch.int64)
+    if isinstance(gate_logits, tuple):
+        compute_device = gate_logits[0].device
+        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
 
-    if len(expert_indices.shape) == 2:
-        expert_indices = expert_indices.unsqueeze(2)
+    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
 
-    expert_mask = torch.nn.functional.one_hot(expert_indices, num_experts)
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
 
-    # For a given token, determine if it was routed to a given expert.
-    expert_mask = torch.max(expert_mask, axis=-2).values
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
 
-    # cast to float32 otherwise mean will fail
-    expert_mask = expert_mask.to(torch.float32)
-    tokens_per_group_and_expert = torch.mean(expert_mask, axis=-2)
+    # Compute the percentage of tokens routed to each experts
+    tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
 
-    router_prob_per_group_and_expert = torch.mean(router_probs, axis=-2)
-    return torch.mean(tokens_per_group_and_expert * router_prob_per_group_and_expert) * (num_experts**2)
+    # Compute the average probability of routing to these experts
+    router_prob_per_expert = torch.mean(routing_weights, dim=0)
+    
+    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+    return overall_loss * num_experts
 
 
 class LlamaRMSNorm(nn.Module):
@@ -1274,8 +1286,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **loss_kwargs)
-            all_router_probs, all_expert_indexes = self._unpack_router_logits(all_router_outputs)
-            blclss = load_balancing_loss_func(all_router_probs, all_expert_indexes)
+            blclss = load_balancing_loss_func(all_router_outputs, num_experts=64, top_k=8)
             loss = loss + 0.01 * blclss
 
         if not return_dict:
